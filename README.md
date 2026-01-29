@@ -84,15 +84,34 @@ cargo build --release
 
 Instead of guessing bandwidth and latency values, use hardware presets that model real-world configurations:
 
+### PCIe (Consumer/Workstation)
+
 | Preset | Bandwidth | Latency | Use Case |
 |--------|-----------|---------|----------|
 | `pcie4_good` | 18 GB/s | 25 µs | PCIe 4.0 with direct GPU-to-GPU P2P |
 | `pcie4_bad` | 12 GB/s | 45 µs | PCIe 4.0 through CPU/switch (common!) |
 | `pcie5_good` | 28 GB/s | 18 µs | PCIe 5.0 with good topology |
 | `pcie5_bad` | 18 GB/s | 35 µs | PCIe 5.0 with suboptimal routing |
-| `nvlink` | 150 GB/s | 3 µs | NVLink interconnect (best case) |
+
+### NVIDIA NVLink (Datacenter)
+
+| Preset | Bandwidth | Latency | Use Case |
+|--------|-----------|---------|----------|
+| `nvlink` | 150 GB/s | 3 µs | NVLink 3.0 (A100) |
+| `nvlink4` | 225 GB/s | 2 µs | NVLink 4.0 (H100) |
+| `nvlink5` | 450 GB/s | 1.5 µs | NVLink 5.0 (B200) |
+
+### AMD / InfiniBand
+
+| Preset | Bandwidth | Latency | Use Case |
+|--------|-----------|---------|----------|
+| `infinity_fabric` | 200 GB/s | 3 µs | AMD Infinity Fabric (MI300) |
+| `ib_hdr` | 25 GB/s | 1.5 µs | InfiniBand HDR (multi-node) |
+| `ib_ndr` | 50 GB/s | 1 µs | InfiniBand NDR (multi-node) |
 
 **Why presets matter:** Most consumer/workstation multi-GPU setups have `pcie4_bad` characteristics - the GPUs communicate through the CPU or a PCIe switch, not directly. This adds significant latency that dominates small-message transfers.
+
+**Note on InfiniBand:** IB presets model multi-node communication. Despite lower bandwidth than NVLink, the ultra-low RDMA latency makes IB competitive for small message sizes.
 
 ```bash
 # Recommended: start with a preset
@@ -174,8 +193,16 @@ This shows the *communication-bound regime* where TP=4 is actually 4.5x slower t
 # PCIe 4.0 "good" topology (direct P2P enabled)
 ./nexora --preset pcie4_good --tp 4
 
-# NVLink (datacenter GPUs)
-./nexora --preset nvlink --tp 4
+# NVLink generations
+./nexora --preset nvlink --tp 8    # A100
+./nexora --preset nvlink4 --tp 8   # H100
+./nexora --preset nvlink5 --tp 8   # B200
+
+# AMD MI300
+./nexora --preset infinity_fabric --tp 8
+
+# Multi-node InfiniBand
+./nexora --preset ib_ndr --tp 8
 ```
 
 ### Exploring Optimizations
