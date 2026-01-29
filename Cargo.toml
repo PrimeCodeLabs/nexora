@@ -1,0 +1,18 @@
+[package]
+name = "nexora"
+version = "1.0.0"
+edition = "2021"
+description = "Multi-GPU LLM inference simulator for understanding tensor-parallel overhead"
+license = "MIT"
+
+[dependencies]
+# Minimal deps: only clap for CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

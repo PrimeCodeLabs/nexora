@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: nexora
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: nexora-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_name: nexora-macos-x86_64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: nexora-linux-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: nexora-windows-x86_64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "${{ matrix.artifact_name }}"
+
+      - name: Generate SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          shasum -a 256 ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.artifact_name }}").Hash.ToLower()
+          "$hash  ${{ matrix.artifact_name }}" | Out-File -Encoding ASCII "${{ matrix.artifact_name }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: release/*
+          body: |
+            ## Installation
+
+            Download the binary for your platform and verify the checksum:
+
+            **macOS (Apple Silicon)**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-macos-arm64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-macos-arm64.sha256
+            shasum -a 256 -c nexora-macos-arm64.sha256
+            chmod +x nexora-macos-arm64
+            ./nexora-macos-arm64 --help
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-macos-x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-macos-x86_64.sha256
+            shasum -a 256 -c nexora-macos-x86_64.sha256
+            chmod +x nexora-macos-x86_64
+            ./nexora-macos-x86_64 --help
+            ```
+
+            **Linux (x86_64)**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-linux-x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-linux-x86_64.sha256
+            sha256sum -c nexora-linux-x86_64.sha256
+            chmod +x nexora-linux-x86_64
+            ./nexora-linux-x86_64 --help
+            ```
+
+            **Windows (x86_64)**
+            ```powershell
+            Invoke-WebRequest -Uri https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-windows-x86_64.exe -OutFile nexora.exe
+            Invoke-WebRequest -Uri https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/nexora-windows-x86_64.exe.sha256 -OutFile nexora.exe.sha256
+            # Verify checksum
+            (Get-FileHash nexora.exe -Algorithm SHA256).Hash.ToLower()
+            Get-Content nexora.exe.sha256
+            .\nexora.exe --help
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
