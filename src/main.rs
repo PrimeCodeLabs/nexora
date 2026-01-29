@@ -107,25 +107,25 @@ fn run_simulation(args: &Cli) {
         let tp2_ratio = tp2_result.ns_per_token as f64 / tp1_result.ns_per_token as f64;
         let tp2_overhead_pct = (tp2_ratio - 1.0) * 100.0;
 
-        let tp4_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
-        let tp4_overhead_pct = (tp4_ratio - 1.0) * 100.0;
+        let tpn_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
+        let tpn_overhead_pct = (tpn_ratio - 1.0) * 100.0;
 
         println!("--- TP Comparison (vs TP=1 baseline) ---");
         println!("  TP=1:  {}  (baseline)", format_ns(tp1_result.ns_per_token));
         println!("  TP=2:  {}  ratio={:.2}x  overhead={:+.1}%",
             format_ns(tp2_result.ns_per_token), tp2_ratio, tp2_overhead_pct);
-        if config.tp >= 4 {
-            println!("  TP=4:  {}  ratio={:.2}x  overhead={:+.1}%",
-                format_ns(baseline.ns_per_token), tp4_ratio, tp4_overhead_pct);
+        if config.tp > 2 {
+            println!("  TP={}:  {}  ratio={:.2}x  overhead={:+.1}%",
+                config.tp, format_ns(baseline.ns_per_token), tpn_ratio, tpn_overhead_pct);
         }
         println!();
 
         // Highlight the pain point
-        if tp4_overhead_pct > 100.0 {
-            println!("  *** Comm-bound regime: TP=4 is {:.1}x slower than TP=1 ***", tp4_ratio);
+        if tpn_overhead_pct > 100.0 {
+            println!("  *** Comm-bound regime: TP={} is {:.1}x slower than TP=1 ***", config.tp, tpn_ratio);
             println!();
-        } else if tp4_overhead_pct > 25.0 {
-            println!("  *** Significant TP overhead: {:.1}% ***", tp4_overhead_pct);
+        } else if tpn_overhead_pct > 25.0 {
+            println!("  *** Significant TP overhead: {:.1}% ***", tpn_overhead_pct);
             println!();
         }
     }
