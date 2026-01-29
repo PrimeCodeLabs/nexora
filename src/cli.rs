@@ -49,7 +49,7 @@ pub struct Cli {
     #[arg(long, default_value = "4", help_heading = "Hardware / Topology")]
     pub tp: u32,
 
-    /// Hardware preset: pcie4_good, pcie4_bad, pcie5_good, pcie5_bad, nvlink
+    /// Hardware preset: pcie4_good, pcie4_bad, pcie5_good, pcie5_bad, nvlink, nvlink4, nvlink5, infinity_fabric, ib_hdr, ib_ndr
     /// [HIGH IMPACT: sets bandwidth and latency]
     #[arg(long, help_heading = "Hardware / Topology")]
     pub preset: Option<String>,

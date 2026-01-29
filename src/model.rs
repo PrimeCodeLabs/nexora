@@ -118,8 +118,18 @@ pub enum HardwarePreset {
     Pcie5Good,
     /// PCIe 5.0 x16 with bad topology
     Pcie5Bad,
-    /// NVLink (for comparison)
+    /// NVLink 3.0 (A100)
     NvLink,
+    /// NVLink 4.0 (H100)
+    NvLink4,
+    /// NVLink 5.0 (B200)
+    NvLink5,
+    /// AMD Infinity Fabric (MI300)
+    InfinityFabric,
+    /// InfiniBand HDR (200 Gb/s)
+    IbHdr,
+    /// InfiniBand NDR (400 Gb/s)
+    IbNdr,
     /// Custom (use CLI params)
     Custom,
 }
@@ -131,7 +141,12 @@ impl HardwarePreset {
             "pcie4_bad" | "pcie4bad" => Some(Self::Pcie4Bad),
             "pcie5_good" | "pcie5good" => Some(Self::Pcie5Good),
             "pcie5_bad" | "pcie5bad" => Some(Self::Pcie5Bad),
-            "nvlink" => Some(Self::NvLink),
+            "nvlink" | "nvlink3" => Some(Self::NvLink),
+            "nvlink4" => Some(Self::NvLink4),
+            "nvlink5" => Some(Self::NvLink5),
+            "infinity_fabric" | "infinityfabric" | "mi300" => Some(Self::InfinityFabric),
+            "ib_hdr" | "ibhdr" | "infiniband_hdr" => Some(Self::IbHdr),
+            "ib_ndr" | "ibndr" | "infiniband_ndr" => Some(Self::IbNdr),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -143,7 +158,12 @@ impl HardwarePreset {
             Self::Pcie4Bad => "PCIe4 Bad Topology",
             Self::Pcie5Good => "PCIe5 Good Topology",
             Self::Pcie5Bad => "PCIe5 Bad Topology",
-            Self::NvLink => "NVLink",
+            Self::NvLink => "NVLink 3.0 (A100)",
+            Self::NvLink4 => "NVLink 4.0 (H100)",
+            Self::NvLink5 => "NVLink 5.0 (B200)",
+            Self::InfinityFabric => "AMD Infinity Fabric (MI300)",
+            Self::IbHdr => "InfiniBand HDR",
+            Self::IbNdr => "InfiniBand NDR",
             Self::Custom => "Custom",
         }
     }
@@ -151,11 +171,16 @@ impl HardwarePreset {
     /// Get bandwidth in GB/s for this preset.
     pub fn bandwidth_gbps(&self) -> f64 {
         match self {
-            Self::Pcie4Good => 18.0,  // ~56% of theoretical 32 GB/s
-            Self::Pcie4Bad => 12.0,   // ~38% due to switch/CPU hop
-            Self::Pcie5Good => 28.0,  // ~44% of theoretical 64 GB/s
-            Self::Pcie5Bad => 18.0,   // ~28% with bad topology
-            Self::NvLink => 150.0,    // NVLink 3.0 per direction
+            Self::Pcie4Good => 18.0,       // ~56% of theoretical 32 GB/s
+            Self::Pcie4Bad => 12.0,        // ~38% due to switch/CPU hop
+            Self::Pcie5Good => 28.0,       // ~44% of theoretical 64 GB/s
+            Self::Pcie5Bad => 18.0,        // ~28% with bad topology
+            Self::NvLink => 150.0,         // NVLink 3.0 per direction (A100)
+            Self::NvLink4 => 225.0,        // NVLink 4.0 per direction (H100: 450/2)
+            Self::NvLink5 => 450.0,        // NVLink 5.0 per direction (B200: 900/2)
+            Self::InfinityFabric => 200.0, // AMD Infinity Fabric (MI300)
+            Self::IbHdr => 25.0,           // InfiniBand HDR: 200 Gb/s = 25 GB/s
+            Self::IbNdr => 50.0,           // InfiniBand NDR: 400 Gb/s = 50 GB/s
             Self::Custom => 20.0,
         }
     }
@@ -163,11 +188,16 @@ impl HardwarePreset {
     /// Get per-collective latency in nanoseconds.
     pub fn latency_ns(&self) -> u64 {
         match self {
-            Self::Pcie4Good => 25_000,  // 25 µs
-            Self::Pcie4Bad => 45_000,   // 45 µs (extra hop)
-            Self::Pcie5Good => 18_000,  // 18 µs
-            Self::Pcie5Bad => 35_000,   // 35 µs
-            Self::NvLink => 3_000,      // 3 µs
+            Self::Pcie4Good => 25_000,     // 25 µs
+            Self::Pcie4Bad => 45_000,      // 45 µs (extra hop)
+            Self::Pcie5Good => 18_000,     // 18 µs
+            Self::Pcie5Bad => 35_000,      // 35 µs
+            Self::NvLink => 3_000,         // 3 µs
+            Self::NvLink4 => 2_000,        // 2 µs (H100)
+            Self::NvLink5 => 1_500,        // 1.5 µs (B200)
+            Self::InfinityFabric => 3_000, // 3 µs (similar to NVLink 3)
+            Self::IbHdr => 1_500,          // 1.5 µs (RDMA)
+            Self::IbNdr => 1_000,          // 1 µs (RDMA)
             Self::Custom => 5_000,
         }
     }
