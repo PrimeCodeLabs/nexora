@@ -7,14 +7,18 @@
 mod cli;
 mod model;
 mod optimize;
+mod server;
 
 #[cfg(test)]
 mod tests;
 
 use clap::Parser;
-use cli::{format_ns, format_pct, format_tps, Cli};
+use cli::{
+    format_ns, format_pct, format_tps, print_comparison_bar, print_time_bar,
+    Cli, JsonOutput, TpComparison, OptimizedResult, OptimizedConfig,
+};
 use model::{
-    risk_estimate, simulate_full_request, simulate_prefill, simulate_token,
+    risk_estimate, simulate_full_request, simulate_pipeline, simulate_prefill, simulate_token,
     simulate_token_with_cache, DecodeWithCacheConfig, HardwarePreset, SimConfig,
 };
 use optimize::{optimize, parameter_sweep, OptParams, SweepResult};
@@ -37,15 +41,124 @@ fn main() {
         return;
     }
 
+    if args.compare.is_some() {
+        run_comparison(&args);
+        return;
+    }
+
+    if let Some(port) = args.serve {
+        server::run_server(&args, port);
+        return;
+    }
+
     run_simulation(&args);
 }
 
 fn run_simulation(args: &Cli) {
     let config = args.to_config();
 
+    // Baseline simulation
+    let baseline = simulate_token(&config);
+    let baseline_risk = risk_estimate(config.group_size, config.precision, config.overlap);
+
+    // TP comparison
+    let tp1_result = simulate_token(&SimConfig { tp: 1, ..config.clone() });
+    let tp_comparison = if config.tp > 1 {
+        let tp2_result = simulate_token(&SimConfig { tp: 2, ..config.clone() });
+        let tp2_ratio = tp2_result.ns_per_token as f64 / tp1_result.ns_per_token as f64;
+        let tpn_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
+        Some(TpComparison {
+            tp1_ns: tp1_result.ns_per_token,
+            tp1_tok_per_sec: tp1_result.tok_per_sec,
+            tp2_ns: tp2_result.ns_per_token,
+            tp2_ratio,
+            tp2_overhead_pct: (tp2_ratio - 1.0) * 100.0,
+            tpn_ns: baseline.ns_per_token,
+            tpn_ratio,
+            tpn_overhead_pct: (tpn_ratio - 1.0) * 100.0,
+        })
+    } else {
+        None
+    };
+
+    // Optimization
+    let optimized = if !args.no_opt && config.tp > 1 {
+        let opt_params = OptParams {
+            max_group: args.max_group,
+            max_risk: args.max_risk,
+            base_overlap: args.overlap,
+            quality_weight: 0.0,
+        };
+        let opt_result = optimize(&config, &opt_params);
+        let speedup_ratio = baseline.ns_per_token as f64 / opt_result.best_result.ns_per_token as f64;
+        Some(OptimizedResult {
+            config: OptimizedConfig {
+                group_size: opt_result.best_config.group_size,
+                precision_bits: opt_result.best_config.precision.bits(),
+                overlap: opt_result.best_config.overlap,
+            },
+            result: opt_result.best_result,
+            risk: opt_result.best_risk,
+            speedup_ratio,
+            speedup_pct: (speedup_ratio - 1.0) * 100.0,
+            configs_evaluated: opt_result.configs_evaluated,
+            configs_rejected_risk: opt_result.configs_rejected_risk,
+        })
+    } else {
+        None
+    };
+
+    // Generate insights
+    let mut insights = Vec::new();
+    if let Some(ref tp_cmp) = tp_comparison {
+        if tp_cmp.tpn_overhead_pct > 100.0 {
+            insights.push(format!(
+                "Communication-bound regime: TP={} is {:.1}x slower than TP=1. Consider NVLink or reducing TP degree.",
+                config.tp, tp_cmp.tpn_ratio
+            ));
+        }
+    }
+    if let Some(ref opt) = optimized {
+        if opt.speedup_ratio > 1.2 {
+            insights.push(format!(
+                "Significant gains possible ({:.1}x speedup) with: group={}, {}bit, {:.0}% overlap",
+                opt.speedup_ratio, opt.config.group_size, opt.config.precision_bits, opt.config.overlap * 100.0
+            ));
+        }
+    }
+    let comm_pct = baseline.comm_total_ns as f64 / baseline.ns_per_token as f64 * 100.0;
+    if comm_pct > 70.0 {
+        insights.push(format!("Communication dominates ({:.0}% of time). Layer grouping or higher bandwidth interconnect recommended.", comm_pct));
+    }
+
+    // JSON output mode
+    if args.json {
+        let output = JsonOutput {
+            preset: args.preset.clone(),
+            config: config.clone(),
+            baseline,
+            baseline_risk,
+            tp_comparison,
+            optimized,
+            insights,
+        };
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        return;
+    }
+
+    // Text output mode
     println!("=== Multi-GPU LLM Inference Simulator ===\n");
 
-    // Show preset if used
+    // Show model preset if used
+    if let Some(model) = args.model_preset() {
+        println!("Model: {} ({:.1}B params{})",
+            model.name(),
+            model.params_billions(),
+            if model.is_moe() { ", MoE" } else { "" }
+        );
+    }
+
+    // Show hardware preset if used
     if let Some(preset_str) = &args.preset {
         if let Some(preset) = HardwarePreset::from_str(preset_str) {
             println!("Hardware Preset: {}", preset.name());
@@ -55,11 +168,21 @@ fn run_simulation(args: &Cli) {
     println!("Configuration:");
     println!("  Layers:        {}", config.layers);
     println!("  TP degree:     {}", config.tp);
+    if config.pp > 1 {
+        println!("  PP degree:     {}", config.pp);
+        println!("  Micro-batches: {}", config.micro_batches);
+    }
     println!("  Compute/layer: {}", format_ns(config.compute_ns));
     println!("  Comm ops/layer: {}", config.comm_ops_per_layer);
     println!("  AR bytes:      {} B", config.ar_bytes);
     if config.ag_bytes > 0 {
         println!("  AG bytes:      {} B", config.ag_bytes);
+    }
+    if config.batch_size > 1 {
+        println!("  Batch size:    {}", config.batch_size);
+    }
+    if config.moe_experts > 0 {
+        println!("  MoE experts:   {} (top-{} routing)", config.moe_experts, config.active_experts);
     }
     println!("  Bandwidth:     {:.1} GB/s", config.bw_gbps);
     println!("  Latency:       {}", format_ns(config.latency_ns));
@@ -71,10 +194,6 @@ fn run_simulation(args: &Cli) {
         println!("  Context len:   {}", config.ctx_len);
     }
     println!();
-
-    // Baseline simulation
-    let baseline = simulate_token(&config);
-    let baseline_risk = risk_estimate(config.group_size, config.precision, config.overlap);
 
     println!("--- Baseline Results (TP={}) ---", config.tp);
     println!("  Time/token:    {}", format_ns(baseline.ns_per_token));
@@ -95,85 +214,86 @@ fn run_simulation(args: &Cli) {
     }
     println!("  Collectives:   {}", baseline.num_collectives);
     println!("  Risk:          {:.2}", baseline_risk);
+    println!("  Bottleneck:    {}", baseline.bottleneck.name());
     println!();
 
-    // Compare with TP=1 and TP=2
-    let tp1_result = simulate_token(&SimConfig { tp: 1, ..config.clone() });
+    // Pipeline parallelism results
+    if config.pp > 1 {
+        let pp_result = simulate_pipeline(&config);
+        println!("--- Pipeline Parallelism (PP={}) ---", config.pp);
+        println!("  Layers/stage:  {}", pp_result.layers_per_stage);
+        println!("  Stage time:    {}", format_ns(pp_result.stage_ns));
+        println!("  PP comm time:  {}", format_ns(pp_result.pp_comm_ns));
+        println!("  Bubble frac:   {:.1}%", pp_result.bubble_fraction * 100.0);
+        println!("  Effective/tok: {}", format_ns(pp_result.effective_ns_per_token));
+        println!("  Throughput:    {}", format_tps(pp_result.tok_per_sec));
 
-    if config.tp > 1 {
-        let tp2_result = simulate_token(&SimConfig { tp: 2, ..config.clone() });
+        // Compare PP vs no-PP
+        let no_pp_config = SimConfig { pp: 1, ..config.clone() };
+        let no_pp = simulate_token(&no_pp_config);
+        let pp_speedup = no_pp.ns_per_token as f64 / pp_result.effective_ns_per_token as f64;
+        if pp_speedup > 1.0 {
+            println!("  PP speedup:    {:.2}x vs TP-only", pp_speedup);
+        } else {
+            println!("  PP overhead:   {:.1}% vs TP-only", (1.0 / pp_speedup - 1.0) * 100.0);
+            if pp_result.bubble_fraction > 0.3 {
+                println!("  ** Consider more micro-batches to reduce bubble overhead **");
+            }
+        }
+        println!();
+    }
 
-        // Calculate ratios and overhead percentages
-        let tp2_ratio = tp2_result.ns_per_token as f64 / tp1_result.ns_per_token as f64;
-        let tp2_overhead_pct = (tp2_ratio - 1.0) * 100.0;
-
-        let tpn_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
-        let tpn_overhead_pct = (tpn_ratio - 1.0) * 100.0;
-
+    // TP Comparison (using pre-computed values)
+    if let Some(ref tp_cmp) = tp_comparison {
         println!("--- TP Comparison (vs TP=1 baseline) ---");
-        println!("  TP=1:  {}  (baseline)", format_ns(tp1_result.ns_per_token));
+        println!("  TP=1:  {}  (baseline)", format_ns(tp_cmp.tp1_ns));
         println!("  TP=2:  {}  ratio={:.2}x  overhead={:+.1}%",
-            format_ns(tp2_result.ns_per_token), tp2_ratio, tp2_overhead_pct);
+            format_ns(tp_cmp.tp2_ns), tp_cmp.tp2_ratio, tp_cmp.tp2_overhead_pct);
         if config.tp > 2 {
             println!("  TP={}:  {}  ratio={:.2}x  overhead={:+.1}%",
-                config.tp, format_ns(baseline.ns_per_token), tpn_ratio, tpn_overhead_pct);
+                config.tp, format_ns(tp_cmp.tpn_ns), tp_cmp.tpn_ratio, tp_cmp.tpn_overhead_pct);
         }
         println!();
 
-        // Highlight the pain point
-        if tpn_overhead_pct > 100.0 {
-            println!("  *** Comm-bound regime: TP={} is {:.1}x slower than TP=1 ***", config.tp, tpn_ratio);
+        if tp_cmp.tpn_overhead_pct > 100.0 {
+            println!("  *** Comm-bound regime: TP={} is {:.1}x slower than TP=1 ***", config.tp, tp_cmp.tpn_ratio);
             println!();
-        } else if tpn_overhead_pct > 25.0 {
-            println!("  *** Significant TP overhead: {:.1}% ***", tpn_overhead_pct);
+        } else if tp_cmp.tpn_overhead_pct > 25.0 {
+            println!("  *** Significant TP overhead: {:.1}% ***", tp_cmp.tpn_overhead_pct);
             println!();
         }
     }
 
-    // Run optimizer if not disabled
-    if !args.no_opt && config.tp > 1 {
-        let opt_params = OptParams {
-            max_group: args.max_group,
-            max_risk: args.max_risk,
-            base_overlap: args.overlap,
-            quality_weight: 0.0,
-        };
-
-        let opt_result = optimize(&config, &opt_params);
-
+    // Optimization results (using pre-computed values)
+    if let Some(ref opt) = optimized {
         println!("--- Optimization Search ---");
-        println!("  Configs evaluated: {}", opt_result.configs_evaluated);
-        println!("  Rejected (risk):   {}", opt_result.configs_rejected_risk);
+        println!("  Configs evaluated: {}", opt.configs_evaluated);
+        println!("  Rejected (risk):   {}", opt.configs_rejected_risk);
         println!();
 
         println!("--- Best Configuration Found ---");
-        println!("  Group size:    {}", opt_result.best_config.group_size);
-        println!("  Precision:     {} bits", opt_result.best_config.precision.bits());
-        println!("  Overlap:       {:.0}%", opt_result.best_config.overlap * 100.0);
-        println!("  Risk:          {:.2}", opt_result.best_risk);
+        println!("  Group size:    {}", opt.config.group_size);
+        println!("  Precision:     {} bits", opt.config.precision_bits);
+        println!("  Overlap:       {:.0}%", opt.config.overlap * 100.0);
+        println!("  Risk:          {:.2}", opt.risk);
         println!();
 
         println!("--- Optimized Results ---");
-        println!("  Time/token:    {}", format_ns(opt_result.best_result.ns_per_token));
-        println!("  Throughput:    {}", format_tps(opt_result.best_result.tok_per_sec));
+        println!("  Time/token:    {}", format_ns(opt.result.ns_per_token));
+        println!("  Throughput:    {}", format_tps(opt.result.tok_per_sec));
         println!("  Compute:       {} ({})",
-            format_ns(opt_result.best_result.compute_total_ns),
-            format_pct(opt_result.best_result.compute_total_ns as f64, opt_result.best_result.ns_per_token as f64)
+            format_ns(opt.result.compute_total_ns),
+            format_pct(opt.result.compute_total_ns as f64, opt.result.ns_per_token as f64)
         );
         println!("  Comm:          {} ({})",
-            format_ns(opt_result.best_result.comm_total_ns),
-            format_pct(opt_result.best_result.comm_total_ns as f64, opt_result.best_result.ns_per_token as f64)
+            format_ns(opt.result.comm_total_ns),
+            format_pct(opt.result.comm_total_ns as f64, opt.result.ns_per_token as f64)
         );
-        println!("  Collectives:   {}", opt_result.best_result.num_collectives);
+        println!("  Collectives:   {}", opt.result.num_collectives);
         println!();
 
-        // Speedup calculations
-        let opt_speedup_ratio = baseline.ns_per_token as f64 / opt_result.best_result.ns_per_token as f64;
-        let opt_speedup_pct = (opt_speedup_ratio - 1.0) * 100.0;
-
-        // TP overhead calculations
-        let tp_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
-        let tp_overhead_pct = (tp_ratio - 1.0) * 100.0;
+        // Get TP comparison values for summary
+        let tp_cmp = tp_comparison.as_ref().unwrap();
 
         // Print compact run summary
         print_run_summary(
@@ -181,17 +301,17 @@ fn run_simulation(args: &Cli) {
             config.bw_gbps,
             config.latency_ns,
             config.tp,
-            tp1_result.ns_per_token,
+            tp_cmp.tp1_ns,
             baseline.ns_per_token,
-            opt_result.best_result.ns_per_token,
-            tp_ratio,
-            tp_overhead_pct,
-            opt_result.best_config.group_size,
-            opt_result.best_config.precision.bits(),
-            opt_result.best_config.overlap,
-            opt_result.best_risk,
-            opt_speedup_ratio,
-            opt_speedup_pct,
+            opt.result.ns_per_token,
+            tp_cmp.tpn_ratio,
+            tp_cmp.tpn_overhead_pct,
+            opt.config.group_size,
+            opt.config.precision_bits,
+            opt.config.overlap,
+            opt.risk,
+            opt.speedup_ratio,
+            opt.speedup_pct,
             &format!("{:?}", config.algo).to_lowercase(),
             config.comm_ops_per_layer,
             config.ar_bytes,
@@ -200,32 +320,66 @@ fn run_simulation(args: &Cli) {
 
         // Key takeaway
         println!();
-        if opt_speedup_ratio > 1.2 {
+        if opt.speedup_ratio > 1.2 {
             println!("KEY INSIGHT: Significant gains possible with optimizations.");
             println!("  Recommendation: group={}, {}bit, {:.0}% overlap",
-                opt_result.best_config.group_size,
-                opt_result.best_config.precision.bits(),
-                opt_result.best_config.overlap * 100.0);
-        } else if opt_speedup_ratio > 1.05 {
+                opt.config.group_size,
+                opt.config.precision_bits,
+                opt.config.overlap * 100.0);
+        } else if opt.speedup_ratio > 1.05 {
             println!("KEY INSIGHT: Modest gains available. Consider NVLink for better scaling.");
         } else {
             println!("KEY INSIGHT: Compute-dominated regime. TP overhead is manageable.");
         }
-    } else if config.tp > 1 {
+    } else if let Some(ref tp_cmp) = tp_comparison {
         // No optimizer, but still print summary for TP comparison
-        let tp_ratio = baseline.ns_per_token as f64 / tp1_result.ns_per_token as f64;
-        let tp_overhead_pct = (tp_ratio - 1.0) * 100.0;
-
         println!("=== RUN SUMMARY ===");
         println!("  preset:       {}", args.preset.as_deref().unwrap_or("custom"));
         println!("  bw/lat:       {:.1} GB/s / {} ns", config.bw_gbps, config.latency_ns);
         println!("  algo/ops:     {:?} / {} ops/layer", config.algo, config.comm_ops_per_layer);
         println!("  ar/ag_bytes:  {} / {} B", config.ar_bytes, config.ag_bytes);
         println!("  tp:           {}", config.tp);
-        println!("  t_tp1:        {} ns", tp1_result.ns_per_token);
+        println!("  t_tp1:        {} ns", tp_cmp.tp1_ns);
         println!("  t_tp{}:        {} ns", config.tp, baseline.ns_per_token);
-        println!("  ratio:        {:.2}x", tp_ratio);
-        println!("  overhead_pct: {:.1}%", tp_overhead_pct);
+        println!("  ratio:        {:.2}x", tp_cmp.tpn_ratio);
+        println!("  overhead_pct: {:.1}%", tp_cmp.tpn_overhead_pct);
+    }
+
+    // ASCII visualization mode
+    if args.ascii {
+        println!();
+        println!("=== ASCII Visualization ===");
+        println!();
+
+        // Time breakdown visualization
+        println!("Time Breakdown (TP={}):", config.tp);
+        print_time_bar("Compute", baseline.compute_total_ns, baseline.ns_per_token, &format_ns(baseline.compute_total_ns));
+        print_time_bar("Comm", baseline.comm_total_ns, baseline.ns_per_token, &format_ns(baseline.comm_total_ns));
+        if baseline.kv_overhead_ns > 0 {
+            print_time_bar("KV", baseline.kv_overhead_ns, baseline.ns_per_token, &format_ns(baseline.kv_overhead_ns));
+        }
+        println!();
+
+        // TP comparison visualization
+        if let Some(ref tp_cmp) = tp_comparison {
+            let max_ns = baseline.ns_per_token.max(tp_cmp.tp1_ns).max(tp_cmp.tp2_ns);
+
+            println!("TP Comparison vs TP=1 baseline:");
+            print_comparison_bar("TP=1", tp_cmp.tp1_ns, tp_cmp.tp1_ns, max_ns, &format_ns(tp_cmp.tp1_ns));
+            print_comparison_bar("TP=2", tp_cmp.tp2_ns, tp_cmp.tp1_ns, max_ns, &format_ns(tp_cmp.tp2_ns));
+            if config.tp > 2 {
+                print_comparison_bar(&format!("TP={}", config.tp), baseline.ns_per_token, tp_cmp.tp1_ns, max_ns, &format_ns(baseline.ns_per_token));
+            }
+            println!();
+
+            // Add insight based on bottleneck
+            let comm_pct = baseline.comm_total_ns as f64 / baseline.ns_per_token as f64 * 100.0;
+            if comm_pct > 50.0 {
+                println!("        ^ INTERCONNECT-BOUND: consider NVLink or reducing TP");
+            } else if comm_pct < 20.0 {
+                println!("        ^ COMPUTE-BOUND: TP scaling is efficient");
+            }
+        }
     }
 }
 
@@ -288,6 +442,83 @@ fn run_sweep(args: &Cli) {
     for result in &results {
         println!("{}", result.to_csv());
     }
+}
+
+fn run_comparison(args: &Cli) {
+    let presets = args.parse_compare_presets();
+    if presets.is_empty() {
+        eprintln!("Error: No valid presets found in --compare argument.");
+        eprintln!("Valid presets: pcie4_good, pcie4_bad, pcie5_good, pcie5_bad, nvlink, nvlink4, nvlink5, infinity_fabric, ib_hdr, ib_ndr");
+        return;
+    }
+
+    let base_config = args.to_config();
+
+    println!("=== Hardware Comparison (TP={}) ===\n", base_config.tp);
+    println!("{:<28} {:>12} {:>12} {:>12} {:>12} {:>10}",
+        "Preset", "Bandwidth", "Latency", "Time/tok", "Overhead", "Speedup");
+    println!("{}", "-".repeat(90));
+
+    // Get TP=1 baseline with first preset (for relative comparison)
+    let first_preset = &presets[0];
+    let tp1_config = SimConfig {
+        tp: 1,
+        bw_gbps: first_preset.bandwidth_gbps(),
+        latency_ns: first_preset.latency_ns(),
+        memory_bw_gbps: first_preset.memory_bw_gbps(),
+        ..base_config.clone()
+    };
+    let tp1_result = simulate_token(&tp1_config);
+
+    // Find the slowest result for relative speedup calculation
+    let mut slowest_ns = 0u64;
+    let mut results = Vec::new();
+
+    for preset in &presets {
+        let config = SimConfig {
+            bw_gbps: preset.bandwidth_gbps(),
+            latency_ns: preset.latency_ns(),
+            memory_bw_gbps: preset.memory_bw_gbps(),
+            ..base_config.clone()
+        };
+        let result = simulate_token(&config);
+
+        let overhead_pct = if tp1_result.ns_per_token > 0 {
+            100.0 * (result.ns_per_token as f64 - tp1_result.ns_per_token as f64)
+                / tp1_result.ns_per_token as f64
+        } else {
+            0.0
+        };
+
+        if result.ns_per_token > slowest_ns {
+            slowest_ns = result.ns_per_token;
+        }
+
+        results.push((preset, result, overhead_pct));
+    }
+
+    // Print results with speedup relative to slowest
+    for (preset, result, overhead_pct) in &results {
+        let speedup = if result.ns_per_token > 0 {
+            slowest_ns as f64 / result.ns_per_token as f64
+        } else {
+            1.0
+        };
+
+        println!("{:<28} {:>9.1} GB/s {:>9} {:>12} {:>+11.1}% {:>9.2}x",
+            preset.name(),
+            preset.bandwidth_gbps(),
+            format_ns(preset.latency_ns()),
+            format_ns(result.ns_per_token),
+            overhead_pct,
+            speedup
+        );
+    }
+
+    println!();
+    println!("Legend:");
+    println!("  Overhead: Time increase vs TP=1 on same hardware");
+    println!("  Speedup:  Relative to slowest preset in comparison");
 }
 
 fn run_ttft_simulation(args: &Cli) {

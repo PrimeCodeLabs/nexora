@@ -21,8 +21,10 @@
 //! - Separate AR (all-reduce) and AG (all-gather) byte sizes
 //! - Context-length dependent KV-cache overhead
 
+use serde::Serialize;
+
 /// Collective algorithm choice for tensor-parallel communication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CollectiveAlgo {
     Ring,
     Tree,
@@ -71,7 +73,7 @@ impl CollectiveAlgo {
 }
 
 /// Communication precision for reduced-precision collectives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CommPrecision {
     FP16,
     FP8,
@@ -104,11 +106,125 @@ impl CommPrecision {
 }
 
 // ============================================================================
+// Model Presets
+// ============================================================================
+
+/// Model preset for popular LLM architectures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ModelPreset {
+    /// Llama 7B (32 layers, 4096 hidden dim)
+    Llama7B,
+    /// Llama 13B (40 layers, 5120 hidden dim)
+    Llama13B,
+    /// Llama 70B (80 layers, 8192 hidden dim)
+    Llama70B,
+    /// Mixtral 8x7B MoE (32 layers, 4096 hidden dim)
+    Mixtral8x7B,
+    /// Mixtral 8x22B MoE (56 layers, 6144 hidden dim)
+    Mixtral8x22B,
+    /// Custom model (use CLI parameters)
+    Custom,
+}
+
+impl ModelPreset {
+    /// Parse from string, case-insensitive.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace("-", "").replace("_", "").as_str() {
+            "llama7b" => Some(Self::Llama7B),
+            "llama13b" => Some(Self::Llama13B),
+            "llama70b" => Some(Self::Llama70B),
+            "mixtral8x7b" => Some(Self::Mixtral8x7B),
+            "mixtral8x22b" => Some(Self::Mixtral8x22B),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Llama7B => "Llama 7B",
+            Self::Llama13B => "Llama 13B",
+            Self::Llama70B => "Llama 70B",
+            Self::Mixtral8x7B => "Mixtral 8x7B",
+            Self::Mixtral8x22B => "Mixtral 8x22B",
+            Self::Custom => "Custom",
+        }
+    }
+
+    /// Number of transformer layers.
+    pub fn layers(&self) -> u32 {
+        match self {
+            Self::Llama7B => 32,
+            Self::Llama13B => 40,
+            Self::Llama70B => 80,
+            Self::Mixtral8x7B => 32,
+            Self::Mixtral8x22B => 56,
+            Self::Custom => 32,
+        }
+    }
+
+    /// Hidden dimension.
+    pub fn hidden_dim(&self) -> u32 {
+        match self {
+            Self::Llama7B => 4096,
+            Self::Llama13B => 5120,
+            Self::Llama70B => 8192,
+            Self::Mixtral8x7B => 4096,
+            Self::Mixtral8x22B => 6144,
+            Self::Custom => 4096,
+        }
+    }
+
+    /// Compute time per layer in nanoseconds (decode, memory-bound).
+    pub fn compute_ns(&self) -> u64 {
+        match self {
+            Self::Llama7B => 60_000,      // 60 µs
+            Self::Llama13B => 90_000,     // 90 µs
+            Self::Llama70B => 180_000,    // 180 µs
+            Self::Mixtral8x7B => 80_000,  // 80 µs (sparse)
+            Self::Mixtral8x22B => 140_000,// 140 µs
+            Self::Custom => 80_000,
+        }
+    }
+
+    /// All-reduce bytes per operation (hidden_dim * 2 for FP16).
+    pub fn ar_bytes(&self) -> u64 {
+        (self.hidden_dim() as u64) * 2
+    }
+
+    /// Number of collective ops per layer.
+    pub fn comm_ops_per_layer(&self) -> u32 {
+        match self {
+            Self::Mixtral8x7B | Self::Mixtral8x22B => 3, // Extra for expert routing
+            _ => 2,
+        }
+    }
+
+    /// Model size in billions of parameters.
+    pub fn params_billions(&self) -> f64 {
+        match self {
+            Self::Llama7B => 7.0,
+            Self::Llama13B => 13.0,
+            Self::Llama70B => 70.0,
+            Self::Mixtral8x7B => 46.7,
+            Self::Mixtral8x22B => 141.0,
+            Self::Custom => 0.0,
+        }
+    }
+
+    /// Whether this is a Mixture of Experts model.
+    pub fn is_moe(&self) -> bool {
+        matches!(self, Self::Mixtral8x7B | Self::Mixtral8x22B)
+    }
+}
+
+// ============================================================================
 // Hardware Profile Presets
 // ============================================================================
 
 /// Hardware profile preset for realistic parameter regimes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum HardwarePreset {
     /// PCIe 4.0 x16 with good topology (direct P2P)
     Pcie4Good,
@@ -201,6 +317,24 @@ impl HardwarePreset {
             Self::Custom => 5_000,
         }
     }
+
+    /// Get HBM memory bandwidth in GB/s for this preset.
+    /// Used to detect memory-bound vs interconnect-bound regimes.
+    pub fn memory_bw_gbps(&self) -> f64 {
+        match self {
+            // PCIe systems typically use consumer/workstation GPUs
+            Self::Pcie4Good | Self::Pcie4Bad => 900.0,    // ~RTX 4090 / A6000
+            Self::Pcie5Good | Self::Pcie5Bad => 1000.0,   // ~RTX 5090
+            // High-end data center GPUs
+            Self::NvLink => 2039.0,        // A100 80GB: 2039 GB/s
+            Self::NvLink4 => 3350.0,       // H100 SXM: 3350 GB/s
+            Self::NvLink5 => 8000.0,       // B200: 8000 GB/s
+            Self::InfinityFabric => 5300.0, // MI300X: 5.3 TB/s
+            Self::IbHdr => 2039.0,         // Typically A100-class
+            Self::IbNdr => 3350.0,         // Typically H100-class
+            Self::Custom => 1000.0,
+        }
+    }
 }
 
 // ============================================================================
@@ -209,12 +343,16 @@ impl HardwarePreset {
 
 /// Configuration for a single simulation run.
 /// All times in nanoseconds, bandwidth in GB/s.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SimConfig {
     /// Number of transformer layers.
     pub layers: u32,
     /// Tensor parallelism degree (1 = no TP, 4 = 4-way split).
     pub tp: u32,
+    /// Pipeline parallelism degree (1 = no PP, 4 = 4-stage pipeline).
+    pub pp: u32,
+    /// Number of micro-batches for pipeline parallelism.
+    pub micro_batches: u32,
     /// Compute time per layer in nanoseconds.
     pub compute_ns: u64,
 
@@ -230,6 +368,8 @@ pub struct SimConfig {
     pub ag_bytes: u64,
     /// Effective inter-GPU bandwidth in GB/s.
     pub bw_gbps: f64,
+    /// HBM memory bandwidth per GPU in GB/s (for bottleneck detection).
+    pub memory_bw_gbps: f64,
     /// Fixed latency per collective operation in nanoseconds.
     pub latency_ns: u64,
     /// Collective algorithm choice.
@@ -249,6 +389,16 @@ pub struct SimConfig {
     pub kv_bytes_base: u64,
     /// Whether KV-cache is sharded across GPUs (adds cross-GPU traffic).
     pub kv_sharded: bool,
+
+    /// Batch size (sequences processed together). Larger batches amortize latency.
+    pub batch_size: u32,
+
+    // MoE (Mixture of Experts) parameters
+
+    /// Number of MoE experts (0 = dense model).
+    pub moe_experts: u32,
+    /// Number of active experts per token (top-k routing).
+    pub active_experts: u32,
 }
 
 impl Default for SimConfig {
@@ -257,11 +407,14 @@ impl Default for SimConfig {
         Self {
             layers: 32,
             tp: 4,
+            pp: 1,                    // No pipeline parallelism by default
+            micro_batches: 1,         // Single micro-batch
             compute_ns: 80_000,       // 80 µs per layer (decode is memory-bound)
             comm_ops_per_layer: 2,    // AR after attention + AR after MLP
             ar_bytes: 32_768,         // 32 KB per AR (hidden_dim * 2 bytes * batch)
             ag_bytes: 0,              // No AG by default
             bw_gbps: 18.0,            // Realistic PCIe 4.0
+            memory_bw_gbps: 900.0,    // Default: ~RTX 4090 class
             latency_ns: 25_000,       // 25 µs per collective
             algo: CollectiveAlgo::Ring,
             group_size: 1,
@@ -270,6 +423,9 @@ impl Default for SimConfig {
             ctx_len: 512,
             kv_bytes_base: 128,       // Bytes per token per layer for KV read (linear)
             kv_sharded: true,
+            batch_size: 1,
+            moe_experts: 0,           // Dense model by default
+            active_experts: 2,        // Top-2 routing typical for MoE
         }
     }
 }
@@ -283,10 +439,58 @@ impl SimConfig {
             ..Default::default()
         }
     }
+
+    /// Create config from a model preset.
+    pub fn from_model_preset(model: ModelPreset) -> Self {
+        Self {
+            layers: model.layers(),
+            compute_ns: model.compute_ns(),
+            ar_bytes: model.ar_bytes(),
+            comm_ops_per_layer: model.comm_ops_per_layer(),
+            ..Default::default()
+        }
+    }
+
+    /// Create config from both hardware and model presets.
+    pub fn from_presets(hw: HardwarePreset, model: ModelPreset) -> Self {
+        Self {
+            layers: model.layers(),
+            compute_ns: model.compute_ns(),
+            ar_bytes: model.ar_bytes(),
+            comm_ops_per_layer: model.comm_ops_per_layer(),
+            bw_gbps: hw.bandwidth_gbps(),
+            latency_ns: hw.latency_ns(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Bottleneck classification for the simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Bottleneck {
+    /// Compute-bound: computation dominates
+    Compute,
+    /// Memory-bound: HBM bandwidth limits performance
+    Memory,
+    /// Interconnect-bound: GPU-to-GPU communication dominates
+    Interconnect,
+    /// Balanced: no single bottleneck dominates (within 20% of each other)
+    Balanced,
+}
+
+impl Bottleneck {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Compute => "COMPUTE-BOUND",
+            Self::Memory => "MEMORY-BOUND",
+            Self::Interconnect => "INTERCONNECT-BOUND",
+            Self::Balanced => "BALANCED",
+        }
+    }
 }
 
 /// Result of a simulation run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct SimResult {
     /// Total time per token in nanoseconds.
     pub ns_per_token: u64,
@@ -300,6 +504,8 @@ pub struct SimResult {
     pub kv_overhead_ns: u64,
     /// Number of collective operations performed.
     pub num_collectives: u32,
+    /// Dominant bottleneck for this workload.
+    pub bottleneck: Bottleneck,
 }
 
 /// Compute communication time for a single collective operation.
@@ -394,8 +600,10 @@ pub fn kv_cache_overhead_ns(
 /// INVARIANT: No heap allocations in this function (hot path).
 #[inline]
 pub fn simulate_token(config: &SimConfig) -> SimResult {
-    // Total compute time: all layers
-    let compute_total_ns = config.compute_ns * config.layers as u64;
+    let batch_size = config.batch_size.max(1) as u64;
+
+    // Total compute time: all layers, scaled by batch size
+    let compute_total_ns = config.compute_ns * config.layers as u64 * batch_size;
 
     // For TP=1, no communication overhead (but still KV cache cost)
     if config.tp <= 1 {
@@ -407,16 +615,32 @@ pub fn simulate_token(config: &SimConfig) -> SimResult {
             false, // Not sharded for TP=1
             config.bw_gbps * 5.0, // Local memory is faster
             0,
-        );
+        ) * batch_size;
 
-        let ns_per_token = compute_total_ns + kv_overhead;
+        let total_batch_ns = compute_total_ns + kv_overhead;
+        let ns_per_token = total_batch_ns / batch_size;
+        let compute_per_tok = compute_total_ns / batch_size;
+        let kv_per_tok = kv_overhead / batch_size;
+
+        // For TP=1, bottleneck is either compute or memory (KV)
+        let bottleneck = if ns_per_token == 0 {
+            Bottleneck::Balanced
+        } else if kv_per_tok as f64 > 0.5 * ns_per_token as f64 {
+            Bottleneck::Memory
+        } else if compute_per_tok as f64 > 0.5 * ns_per_token as f64 {
+            Bottleneck::Compute
+        } else {
+            Bottleneck::Balanced
+        };
+
         return SimResult {
             ns_per_token,
             tok_per_sec: 1e9 / ns_per_token as f64,
-            compute_total_ns,
+            compute_total_ns: compute_per_tok,
             comm_total_ns: 0,
-            kv_overhead_ns: kv_overhead,
+            kv_overhead_ns: kv_per_tok,
             num_collectives: 0,
+            bottleneck,
         };
     }
 
@@ -430,10 +654,11 @@ pub fn simulate_token(config: &SimConfig) -> SimResult {
     let num_collectives = groups * ops_per_group;
 
     // Payload per collective: sum across grouped layers, scaled by precision
+    // Batch size increases payload (more data to reduce/gather)
     let layers_in_group = group_size.min(config.layers);
 
-    // Calculate AR time
-    let ar_payload = config.ar_bytes * layers_in_group as u64;
+    // Calculate AR time - payload scales with batch size
+    let ar_payload = config.ar_bytes * layers_in_group as u64 * batch_size;
     let ar_scaled = (ar_payload as f64 * config.precision.scale_factor()).ceil() as u64;
     let ar_time = comm_time_ns(
         ar_scaled,
@@ -444,9 +669,9 @@ pub fn simulate_token(config: &SimConfig) -> SimResult {
         false,
     );
 
-    // Calculate AG time (if applicable)
+    // Calculate AG time (if applicable) - payload scales with batch size
     let ag_time = if config.ag_bytes > 0 {
-        let ag_payload = config.ag_bytes * layers_in_group as u64;
+        let ag_payload = config.ag_bytes * layers_in_group as u64 * batch_size;
         let ag_scaled = (ag_payload as f64 * config.precision.scale_factor()).ceil() as u64;
         comm_time_ns(
             ag_scaled,
@@ -470,14 +695,37 @@ pub fn simulate_token(config: &SimConfig) -> SimResult {
     };
     let comm_per_group = ar_ops as u64 * ar_time + ag_ops as u64 * ag_time;
 
-    // Total raw communication time
-    let raw_comm_total_ns = comm_per_group * groups as u64;
+    // MoE all-to-all communication (for Mixture of Experts models)
+    // MoE adds dispatch and combine all-to-all operations per MoE layer
+    let moe_comm_ns = if config.moe_experts > 0 && config.tp > 1 {
+        // All-to-all sends data fraction (tp-1)/tp per operation
+        // Payload: tokens * active_experts * hidden_dim * dtype
+        let data_fraction = (config.tp - 1) as f64 / config.tp as f64;
+        let a2a_payload = (config.ar_bytes as f64 * batch_size as f64
+            * config.active_experts as f64 / 2.0 // Approximate activation size
+            * data_fraction) as u64;
+
+        // All-to-all is bandwidth-bound, less latency overhead than collective
+        let a2a_bw_ns = (a2a_payload as f64 / (config.bw_gbps * 1e9) * 1e9) as u64;
+        let a2a_latency = config.latency_ns / 2; // A2A typically lower latency
+
+        // Two all-to-all ops per MoE layer: dispatch + combine
+        let a2a_per_layer = 2 * (a2a_bw_ns + a2a_latency);
+
+        // MoE layers (assume all layers are MoE if moe_experts > 0)
+        a2a_per_layer * config.layers as u64
+    } else {
+        0
+    };
+
+    // Total raw communication time for the batch
+    let raw_comm_total_ns = comm_per_group * groups as u64 + moe_comm_ns;
 
     // Apply overlap: fraction of comm hidden under compute
     let overlap_clamped = config.overlap.clamp(0.0, 0.95);
     let visible_comm_ns = (raw_comm_total_ns as f64 * (1.0 - overlap_clamped)).ceil() as u64;
 
-    // KV-cache overhead (sharded across GPUs)
+    // KV-cache overhead (sharded across GPUs), scales with batch size
     let kv_overhead = kv_cache_overhead_ns(
         config.ctx_len,
         config.layers,
@@ -486,18 +734,143 @@ pub fn simulate_token(config: &SimConfig) -> SimResult {
         config.kv_sharded,
         config.bw_gbps,
         config.latency_ns,
-    );
+    ) * batch_size;
 
-    // Total token time
-    let ns_per_token = compute_total_ns + visible_comm_ns + kv_overhead;
+    // Total batch time
+    let total_batch_ns = compute_total_ns + visible_comm_ns + kv_overhead;
+
+    // Per-token time (batch amortization benefit)
+    // Latency is amortized across batch_size tokens
+    let ns_per_token = total_batch_ns / batch_size;
+    let compute_per_tok = compute_total_ns / batch_size;
+    let comm_per_tok = visible_comm_ns / batch_size;
+    let kv_per_tok = kv_overhead / batch_size;
+
+    // Determine bottleneck based on time breakdown
+    let bottleneck = if ns_per_token == 0 {
+        Bottleneck::Balanced
+    } else {
+        let total = ns_per_token as f64;
+        let compute_frac = compute_per_tok as f64 / total;
+        let comm_frac = comm_per_tok as f64 / total;
+        let kv_frac = kv_per_tok as f64 / total;
+
+        // Find the dominant factor (>50% of time)
+        if comm_frac > 0.5 {
+            Bottleneck::Interconnect
+        } else if compute_frac > 0.5 {
+            Bottleneck::Compute
+        } else if kv_frac > 0.5 {
+            Bottleneck::Memory
+        } else {
+            // No single factor dominates - check if one is clearly largest
+            if comm_frac > compute_frac && comm_frac > kv_frac && comm_frac > 0.35 {
+                Bottleneck::Interconnect
+            } else if compute_frac > comm_frac && compute_frac > kv_frac && compute_frac > 0.35 {
+                Bottleneck::Compute
+            } else if kv_frac > compute_frac && kv_frac > comm_frac && kv_frac > 0.35 {
+                Bottleneck::Memory
+            } else {
+                Bottleneck::Balanced
+            }
+        }
+    };
 
     SimResult {
         ns_per_token,
         tok_per_sec: if ns_per_token > 0 { 1e9 / ns_per_token as f64 } else { 0.0 },
-        compute_total_ns,
-        comm_total_ns: visible_comm_ns,
-        kv_overhead_ns: kv_overhead,
+        compute_total_ns: compute_per_tok,
+        comm_total_ns: comm_per_tok,
+        kv_overhead_ns: kv_per_tok,
         num_collectives,
+        bottleneck,
+    }
+}
+
+/// Result of a pipeline parallelism simulation.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PipelineResult {
+    /// Time per token per stage in nanoseconds.
+    pub stage_ns: u64,
+    /// Pipeline bubble fraction (wasted compute due to ramp-up/down).
+    pub bubble_fraction: f64,
+    /// Point-to-point communication time per stage.
+    pub pp_comm_ns: u64,
+    /// Effective time per token accounting for bubbles.
+    pub effective_ns_per_token: u64,
+    /// Tokens per second.
+    pub tok_per_sec: f64,
+    /// Number of layers per pipeline stage.
+    pub layers_per_stage: u32,
+}
+
+/// Simulate pipeline parallelism with TP within each stage.
+///
+/// Models the 1F1B (one forward, one backward) schedule where:
+/// - Layers are split across PP stages
+/// - Each stage has TP GPUs
+/// - Micro-batches reduce bubble overhead
+/// - PP uses point-to-point communication (not all-reduce)
+pub fn simulate_pipeline(config: &SimConfig) -> PipelineResult {
+    let pp = config.pp.max(1);
+    let micro_batches = config.micro_batches.max(1);
+
+    // Layers per pipeline stage
+    let layers_per_stage = (config.layers + pp - 1) / pp;
+
+    // Simulate a single stage (with TP within the stage)
+    let stage_config = SimConfig {
+        layers: layers_per_stage,
+        pp: 1, // No nested PP within stage
+        ..config.clone()
+    };
+    let stage_result = simulate_token(&stage_config);
+    let stage_ns = stage_result.ns_per_token;
+
+    // Pipeline bubble fraction: (pp - 1) / (micro_batches + pp - 1)
+    // This represents the fraction of time lost to pipeline startup/shutdown
+    let bubble_fraction = if micro_batches + pp > 1 {
+        (pp - 1) as f64 / (micro_batches + pp - 1) as f64
+    } else {
+        0.0
+    };
+
+    // Point-to-point communication between stages
+    // Activation size between stages (hidden_dim * seq_len * dtype_bytes)
+    // For decode, this is small (single token)
+    let activation_bytes = config.ar_bytes; // Reuse AR bytes as activation size estimate
+    let pp_comm_ns = if pp > 1 {
+        // Point-to-point is simpler than collective - just bandwidth + latency
+        let bw_ns = (activation_bytes as f64 / (config.bw_gbps * 1e9) * 1e9) as u64;
+        let latency = config.latency_ns / 2; // P2P typically lower latency than collectives
+        bw_ns + latency
+    } else {
+        0
+    };
+
+    // Total time per token through pipeline:
+    // steady_state = stage_ns + pp_comm_ns
+    // effective = steady_state / (1 - bubble_fraction)
+    let steady_state_ns = stage_ns + pp_comm_ns;
+    let effective_ns_per_token = if bubble_fraction < 1.0 {
+        (steady_state_ns as f64 / (1.0 - bubble_fraction)) as u64
+    } else {
+        steady_state_ns
+    };
+
+    let tok_per_sec = if effective_ns_per_token > 0 {
+        1e9 / effective_ns_per_token as f64
+    } else {
+        0.0
+    };
+
+    PipelineResult {
+        stage_ns,
+        bubble_fraction,
+        pp_comm_ns,
+        effective_ns_per_token,
+        tok_per_sec,
+        layers_per_stage,
     }
 }
 
@@ -566,7 +939,7 @@ impl Default for PrefillConfig {
 }
 
 /// Result of prefill simulation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct PrefillResult {
     /// Time to first token (TTFT) in nanoseconds.
     pub ttft_ns: u64,
@@ -581,7 +954,7 @@ pub struct PrefillResult {
 }
 
 /// Result of a full request (prefill + decode).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct FullRequestResult {
     /// Prefill stage result.
     pub prefill: PrefillResult,

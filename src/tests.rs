@@ -371,7 +371,7 @@ mod edge_cases {
 
 #[cfg(test)]
 mod allocation_free {
-    use crate::model::{CollectiveAlgo, CommPrecision, SimConfig, SimResult};
+    use crate::model::{Bottleneck, CollectiveAlgo, CommPrecision, SimConfig, SimResult};
 
     /// Verify that all hot-path types implement Copy (no heap allocation needed).
     #[test]
@@ -391,6 +391,7 @@ mod allocation_free {
             comm_total_ns: 20,
             kv_overhead_ns: 0,
             num_collectives: 1,
+            bottleneck: Bottleneck::Compute,
         };
         let _result_copy: SimResult = result;
         let _result_copy2: SimResult = result;

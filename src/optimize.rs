@@ -3,10 +3,12 @@
 //! Searches over group size, precision bits, and overlap to find
 //! the best configuration minimizing ns/token subject to risk constraints.
 
+use serde::Serialize;
+
 use crate::model::{risk_estimate, simulate_token, CommPrecision, SimConfig, SimResult};
 
 /// Optimization search parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OptParams {
     /// Maximum group size to search.
     pub max_group: u32,
@@ -30,7 +32,7 @@ impl Default for OptParams {
 }
 
 /// Result of optimization search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OptResult {
     /// Best configuration found.
     pub best_config: SimConfig,
@@ -210,7 +212,7 @@ pub fn parameter_sweep(
 }
 
 /// Single result from parameter sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SweepResult {
     pub bw_gbps: f64,
     pub latency_ns: u64,

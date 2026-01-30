@@ -1,13 +1,22 @@
 [package]
 name = "nexora"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Multi-GPU LLM inference simulator for understanding tensor-parallel overhead"
 license = "MIT"
 
 [dependencies]
-# Minimal deps: only clap for CLI parsing
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Optional TUI dependencies
+ratatui = { version = "0.26", optional = true }
+crossterm = { version = "0.27", optional = true }
+
+[features]
+default = []
+tui = ["ratatui", "crossterm"]
 
 [profile.release]
 opt-level = 3
